@@ -1,0 +1,65 @@
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.egg-info
+.venv
+venv
+env
+
+# Dev / IDE
+.idea
+.vscode
+.devcontainer
+.DS_Store
+*.swp
+.ipynb_checkpoints
+notebooks
+
+# Tests / CI
+tests
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Data & models (do not bake into image)
+data
+models
+checkpoints
+wandb
+mlruns
+outputs
+runs
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.csv
+*.parquet
+*.jsonl
+
+# Credentials — NEVER bake into image
+*credentials*.json
+*service-account*.json
+*breakglass*.json
+bq-breakglass*.json
+*.pem
+*.key
+credentials
+secrets
+.env
+.env.*
+
+# Logs
+*.log
+logs
+
+# Docs / meta (optional; keep CLAUDE.md out of image)
+CLAUDE.md
+README.md

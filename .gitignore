@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Env
+.env
+.env.local
+*.env
+
+# Credentials — NEVER commit
+*credentials*.json
+*service-account*.json
+*breakglass*.json
+bq-breakglass*.json
+*.pem
+*.key
+credentials/
+secrets/
+
+# Raw data dumps (CSV/Parquet/JSONL) — not committed; keep in data/raw/
+*.csv
+*.parquet
+*.jsonl
+
+# Data & models (按需调整)
+data/raw/*
+data/processed/*
+data/labeled/*
+data/splits/*
+!data/**/.gitkeep
+!data/**/README.md
+
+models/
+checkpoints/
+wandb/
+mlruns/
+outputs/
+runs/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Logs
+*.log
+logs/
+
+# Local inventory dumps
+.bq_inventory/
