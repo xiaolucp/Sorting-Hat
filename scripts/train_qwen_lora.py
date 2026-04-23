@@ -32,7 +32,7 @@ from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
 
-from sorting_hat.labeling.prompts import SYSTEM_PROMPT, USER_TEMPLATE
+from sorting_hat.labeling.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_SHORT, USER_TEMPLATE
 
 
 def build_user(ex: dict) -> str:
@@ -67,7 +67,7 @@ def build_assistant(ex: dict) -> str:
     return json.dumps(out, ensure_ascii=False)
 
 
-def load_dataset(path: pathlib.Path) -> Dataset:
+def load_dataset(path: pathlib.Path, system_prompt: str) -> Dataset:
     rows = []
     for line in path.open():
         if not line.strip():
@@ -76,7 +76,7 @@ def load_dataset(path: pathlib.Path) -> Dataset:
         rows.append(
             {
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": build_user(ex)},
                     {"role": "assistant", "content": build_assistant(ex)},
                 ]
@@ -106,7 +106,15 @@ def main():
     ap.add_argument("--lora-r", type=int, default=16)
     ap.add_argument("--lora-alpha", type=int, default=32)
     ap.add_argument("--max-seq-len", type=int, default=2048)
+    ap.add_argument("--eval-data", type=pathlib.Path, default=None,
+                    help="optional eval JSONL (same format as --data) — enables periodic eval")
+    ap.add_argument("--eval-steps", type=int, default=50,
+                    help="eval every N optimizer steps (only used when --eval-data is set)")
     ap.add_argument("--no-smoke-test", action="store_true")
+    ap.add_argument("--prompt", choices=["short", "full"], default="short",
+                    help="system prompt variant: 'short' (~205 tok, compact for LoRA) or 'full' (~2013 tok, labeler rubric)")
+    ap.add_argument("--resume", action="store_true",
+                    help="resume from latest checkpoint in --output dir (if any)")
     args = ap.parse_args()
 
     device = pick_device()
@@ -120,6 +128,10 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Most samples exceed max_length (prior_turns context is long). Default
+    # truncation_side="right" would cut off the assistant JSON — the very thing
+    # we want to train on. Cut from the left (drop oldest prior_turns) instead.
+    tokenizer.truncation_side = "left"
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=dtype,
@@ -128,8 +140,14 @@ def main():
     model.config.use_cache = False
 
     print("[2/5] building dataset ...", file=sys.stderr)
-    ds = load_dataset(args.data)
-    print(f"    samples: {len(ds)}", file=sys.stderr)
+    sys_prompt = SYSTEM_PROMPT_SHORT if args.prompt == "short" else SYSTEM_PROMPT
+    print(f"    prompt variant: {args.prompt}  (~{len(sys_prompt)//4} tokens)", file=sys.stderr)
+    ds = load_dataset(args.data, sys_prompt)
+    print(f"    train samples: {len(ds)}", file=sys.stderr)
+    eval_ds = None
+    if args.eval_data is not None:
+        eval_ds = load_dataset(args.eval_data, sys_prompt)
+        print(f"    eval  samples: {len(eval_ds)}", file=sys.stderr)
 
     print("[3/5] configuring LoRA ...", file=sys.stderr)
     lora = LoraConfig(
@@ -142,7 +160,7 @@ def main():
         task_type="CAUSAL_LM",
     )
 
-    sft_cfg = SFTConfig(
+    sft_kwargs = dict(
         output_dir=str(args.output),
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -150,26 +168,35 @@ def main():
         learning_rate=args.lr,
         warmup_ratio=0.1,
         logging_steps=1,
-        save_strategy="epoch",
-        save_total_limit=1,
+        save_strategy="steps",
+        save_steps=200,                      # checkpoint every 200 steps for crash resilience
+        save_total_limit=3,                   # keep last 3 checkpoints
         bf16=(device == "cuda"),
         fp16=False,
         report_to=[],
-        gradient_checkpointing=False,
+        gradient_checkpointing=True,
         max_length=args.max_seq_len,
         completion_only_loss=True,          # mask prompt, only loss on assistant response
-        assistant_only_loss=True,           # belt-and-suspenders
+        packing=True,                        # concat short samples up to max_length — faster
     )
+    if eval_ds is not None:
+        sft_kwargs.update(
+            eval_strategy="steps",
+            eval_steps=args.eval_steps,
+            per_device_eval_batch_size=args.batch_size,  # same as train; larger OOMs on A10G
+        )
+    sft_cfg = SFTConfig(**sft_kwargs)
 
     print("[4/5] starting training ...", file=sys.stderr)
     trainer = SFTTrainer(
         model=model,
         train_dataset=ds,
+        eval_dataset=eval_ds,
         args=sft_cfg,
         peft_config=lora,
         processing_class=tokenizer,
     )
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume)
     trainer.save_model(str(args.output))
     tokenizer.save_pretrained(str(args.output))
     print(f"[5/5] saved adapter to {args.output}", file=sys.stderr)
@@ -181,7 +208,8 @@ def main():
     first = ds[0]
     messages = first["messages"][:-1]  # system + user only (drop gold assistant)
     prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        messages, tokenize=False, add_generation_prompt=True,
+        enable_thinking=False,  # Qwen3 default adds <think>\n prefix; we train on direct JSON
     )
     inputs = tokenizer(prompt, return_tensors="pt").to(trainer.model.device)
     with torch.no_grad():
