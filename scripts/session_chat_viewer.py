@@ -20,6 +20,7 @@ import streamlit.components.v1 as components
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data" / "raw"
 LABELED_DIR = ROOT / "data" / "labeled"
+PRED_DIR = ROOT / "data" / "predictions"
 
 ROLE_SIDE = {"interviewer": "left", "interviewee": "right"}
 ROLE_COLOR = {
@@ -160,12 +161,45 @@ def fmt_offset(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
+def _render_badge(
+    source_name: str,
+    label: str | None,
+    confidence: float | None,
+    reason: str | None,
+    agrees_with_gold: bool | None = None,
+) -> str:
+    """Render a single label badge. source_name shown as a small prefix (e.g. 'gold', 'v5')."""
+    if not label:
+        return ""
+    colors = LABEL_COLOR.get(label)
+    if not colors:
+        return ""
+    _, _, badge_bg = colors
+    display = html.escape(LABEL_DISPLAY.get(label, label))
+    reason_str = html.escape(((reason or "")[:300]))
+    conf_str = f" {confidence:.0%}" if confidence is not None else ""
+    agree_mark = ""
+    if agrees_with_gold is True:
+        agree_mark = ' <span style="color:#16a34a;">✓</span>'
+    elif agrees_with_gold is False:
+        agree_mark = ' <span style="color:#dc2626;">✗</span>'
+    return (
+        f'<span class="label-badge reason-tip" style="background:{badge_bg}" '
+        f'title="{source_name}: {reason_str}">'
+        f'<span style="opacity:.7;font-size:.62rem;">{html.escape(source_name)}</span> '
+        f'{display}</span>'
+        f'<span class="confidence">{conf_str}</span>{agree_mark} '
+    )
+
+
 def render_bubble(
     role: str,
     text: str,
     offset: str,
     source: str | None,
     label_info: dict | None = None,
+    pred_info: dict | None = None,
+    overlay_mode: str = "both",  # "gold" / "pred" / "both" / "none"
 ) -> str:
     side = ROLE_SIDE.get(role, "left")
     bubble_bg = ROLE_COLOR.get(role, "#ddd")
@@ -175,21 +209,31 @@ def render_bubble(
     src_title = html.escape(source or "unknown")
     esc_text = html.escape(text).replace("\n", "<br>")
 
-    # Override bubble colour if we have a label for this turn
-    badge_html = ""
-    if label_info:
-        lname = label_info.get("label", "")
-        colors = LABEL_COLOR.get(lname)
-        if colors:
-            bubble_bg, bubble_fg, badge_bg = colors
-        conf = label_info.get("confidence", 0)
-        reason = html.escape((label_info.get("reason") or "")[:300])
-        display = html.escape(LABEL_DISPLAY.get(lname, lname))
-        badge_html = (
-            f'<span class="label-badge reason-tip" style="background:{badge_bg}" title="{reason}">'
-            f'{display}</span>'
-            f'<span class="confidence">{conf:.0%}</span>'
-        )
+    gold_lbl = label_info.get("label") if label_info else None
+    pred_lbl = pred_info.get("pred_label") if pred_info else None
+
+    # Bubble colour: use whichever is "primary" per overlay_mode.
+    #   "both"/"gold" → gold colour; "pred" → pred colour.
+    primary = pred_lbl if overlay_mode == "pred" else gold_lbl
+    if primary and primary in LABEL_COLOR:
+        bubble_bg, bubble_fg, _ = LABEL_COLOR[primary]
+
+    badges = []
+    if overlay_mode in ("gold", "both") and label_info:
+        badges.append(_render_badge(
+            "gold", gold_lbl,
+            label_info.get("confidence"), label_info.get("reason"),
+        ))
+    if overlay_mode in ("pred", "both") and pred_info:
+        agrees = None
+        if gold_lbl and pred_lbl:
+            agrees = (gold_lbl == pred_lbl)
+        badges.append(_render_badge(
+            "v5", pred_lbl,
+            pred_info.get("pred_confidence"), pred_info.get("pred_reason"),
+            agrees_with_gold=agrees,
+        ))
+    badge_html = "".join(badges)
 
     avatar_html = f'<div class="avatar" title="{html.escape(role)}">{avatar}</div>'
     meta_html = (
@@ -254,7 +298,8 @@ def _pt_set(events: list[dict]) -> set[str]:
     return out
 
 
-def session_label(s: dict, labels: dict[str, dict] | None = None) -> str:
+def session_label(s: dict, labels: dict[str, dict] | None = None,
+                   preds: dict[str, dict] | None = None) -> str:
     mode = s.get("interview_mode", "?")
     nt = s.get("n_turns", 0)
     goal = (s.get("goal_position") or "")[:30]
@@ -272,10 +317,27 @@ def session_label(s: dict, labels: dict[str, dict] | None = None) -> str:
             short = {"coding": "cod", "system_design": "sd", "project_qa": "pqa",
                      "chat": "chat", "no_answer_needed": "nan"}
             label_summary = "  🏷 " + " ".join(f"{short.get(k,k)}:{v}" for k, v in c.most_common())
-    return f"{s['session_id'][:10]} · {mode} · {nt}t · {goal}{pt_badge}{label_summary}"
+    pred_mark = ""
+    if preds and labels:
+        labeled_tids = [t.get("trace_id") for t in s.get("turns", [])
+                        if t.get("trace_id") in labels]
+        if labeled_tids:
+            n_pred = sum(1 for tid in labeled_tids if tid in preds)
+            if n_pred == len(labeled_tids):
+                pred_mark = "  🤖✓"
+            elif n_pred > 0:
+                pred_mark = f"  🤖{n_pred}/{len(labeled_tids)}"
+    return f"{s['session_id'][:10]} · {mode} · {nt}t · {goal}{pt_badge}{label_summary}{pred_mark}"
 
 
-def load_labels(date_str: str) -> dict[str, dict]:
+@st.cache_data(show_spinner=False)
+def load_sessions_cached(path_str: str, mtime: float) -> list[dict]:
+    """Load raw session file. mtime is in the key so cache invalidates if file changes."""
+    return json.loads(Path(path_str).read_text())
+
+
+@st.cache_data(show_spinner=False)
+def load_labels(date_str: str, mtime: float = 0.0) -> dict[str, dict]:
     """Load labeled turns for a given date. Returns trace_id → label record."""
     path = LABELED_DIR / f"turns_{date_str}.jsonl"
     if not path.exists():
@@ -295,6 +357,34 @@ def load_labels(date_str: str) -> dict[str, dict]:
     return out
 
 
+@st.cache_data(show_spinner=False)
+def load_predictions(date_str: str, mtime: float = 0.0, variant: str = "v5") -> dict[str, dict]:
+    """Load model predictions. mtime key ensures cache refreshes when predict_day.py appends rows."""
+    path = PRED_DIR / f"turns_{variant}_{date_str}.jsonl"
+    if not path.exists():
+        return {}
+    out: dict[str, dict] = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            tid = rec.get("turn_id")
+            if tid:
+                out[tid] = rec
+        except Exception:
+            pass
+    return out
+
+
+def _path_mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except FileNotFoundError:
+        return 0.0
+
+
 st.set_page_config(page_title="FRAI Session Chat Viewer", layout="wide")
 st.markdown(CSS, unsafe_allow_html=True)
 st.title("FRAI Session Chat Viewer")
@@ -307,16 +397,37 @@ if not files:
 with st.sidebar:
     st.header("Data")
     chosen = st.selectbox("File", [f.name for f in files], index=len(files) - 1)
-    sessions = json.loads((DATA_DIR / chosen).read_text())
+    sessions_path = DATA_DIR / chosen
+    sessions = load_sessions_cached(str(sessions_path), _path_mtime(sessions_path))
     st.caption(f"{len(sessions)} sessions loaded")
 
     # Derive date string from filename, e.g. "frai_sessions_2026-04-20.json" → "2026-04-20"
     date_str = chosen.removeprefix("frai_sessions_").removesuffix(".json")
-    labels: dict[str, dict] = load_labels(date_str)
+    labeled_path = LABELED_DIR / f"turns_{date_str}.jsonl"
+    labels: dict[str, dict] = load_labels(date_str, _path_mtime(labeled_path))
     if labels:
         st.caption(f"✅ {len(labels):,} labeled turns loaded")
     else:
         st.caption("⚠️ No labels — run `label_sessions.py --date {date_str}`")
+
+    preds_path = PRED_DIR / f"turns_v5_{date_str}.jsonl"
+    preds: dict[str, dict] = load_predictions(date_str, _path_mtime(preds_path), variant="v5")
+    if preds:
+        st.caption(f"🤖 {len(preds):,} v5 LoRA predictions loaded")
+    else:
+        st.caption(f"ℹ️ No v5 predictions — run `predict_day.py --date {date_str}`")
+
+    overlay_options = ["gold only"]
+    if preds:
+        overlay_options = ["both (gold + v5)", "gold only", "v5 predictions only"]
+    overlay_choice = st.radio(
+        "Overlay", overlay_options, index=0 if len(overlay_options) == 1 else 0,
+    )
+    overlay_mode = {
+        "both (gold + v5)": "both",
+        "gold only": "gold",
+        "v5 predictions only": "pred",
+    }.get(overlay_choice, "gold")
 
     st.header("Filters")
     only_interviewer = st.checkbox("Has interviewer turn", value=True)
@@ -333,6 +444,15 @@ with st.sidebar:
         only_labeled = st.checkbox("Has labeled turns", value=False)
         all_labels = ["coding", "system_design", "project_qa", "chat", "no_answer_needed"]
         label_filter = st.multiselect("intent label (any turn)", all_labels)
+
+    pred_filter = "all"
+    if preds:
+        pred_filter = st.radio(
+            "Prediction coverage",
+            ["all", "any labeled turn predicted", "all labeled turns predicted"],
+            index=0,
+            help="Filter sessions by how many of their labeled turns have a v5 prediction.",
+        )
 
 def _session_trace_ids(s: dict) -> set[str]:
     out = set()
@@ -365,6 +485,15 @@ for s in sessions:
     if label_filter and labels:
         session_labels = {labels[tid]["label"] for tid in tids if tid in labels}
         if not any(lbl in session_labels for lbl in label_filter):
+            continue
+    if preds and pred_filter != "all":
+        labeled_tids = {tid for tid in tids if tid in labels}
+        predicted_tids = {tid for tid in labeled_tids if tid in preds}
+        if pred_filter == "any labeled turn predicted" and not predicted_tids:
+            continue
+        if pred_filter == "all labeled turns predicted" and (
+            not labeled_tids or predicted_tids != labeled_tids
+        ):
             continue
     filtered.append(s)
 
@@ -405,7 +534,11 @@ with st.sidebar:
     else:
         filtered = sorted(filtered, key=lambda s: s["session_id"])
 
-    sel = st.radio("Session", range(len(filtered)), format_func=lambda i: session_label(filtered[i], labels))
+    sel = st.radio(
+        "Session",
+        range(len(filtered)),
+        format_func=lambda i: session_label(filtered[i], labels, preds),
+    )
 
 if not filtered:
     st.info("No sessions match current filter.")
@@ -465,11 +598,14 @@ for dt, kind, item in timeline:
     if kind == "turn":
         trace_id = item.get("trace_id")
         label_info = labels.get(trace_id) if (trace_id and labels) else None
+        pred_info = preds.get(trace_id) if (trace_id and preds) else None
         blocks.append(render_bubble(item.get("role") or "unknown",
                                     item.get("text") or "",
                                     off,
                                     item.get("source"),
-                                    label_info))
+                                    label_info,
+                                    pred_info,
+                                    overlay_mode))
     else:
         blocks.append(render_event(item.get("event_type", ""),
                                    item.get("problem_type"),
