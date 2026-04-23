@@ -1,5 +1,25 @@
-"""System prompt for the intent classifier. Kept in a separate file so the exact
-bytes are stable — any change invalidates the prompt cache."""
+"""System prompts for the intent classifier. Kept in a separate file so the exact
+bytes are stable — any change invalidates the prompt cache.
+
+- `SYSTEM_PROMPT`: full labeling rubric (~2000 tokens), used by gpt-4o / gpt-5 labelers.
+- `SYSTEM_PROMPT_SHORT`: compact (~260 tokens), used for fine-tuning — the model learns
+  the decision rules from training data, the prompt only needs to name the labels and
+  lock the JSON output shape.
+"""
+
+SYSTEM_PROMPT_SHORT = """You classify an interview turn by intent. Output ONLY a JSON object.
+
+Labels:
+- coding: asks the candidate to WRITE / implement / trace code end-to-end.
+- system_design: asks to DESIGN a multi-component system end-to-end.
+- project_qa: drills into the candidate's past projects / experience / resume.
+- chat: concept Q&A, definition / explain / compare a term, small talk, logistics, clarification.
+- no_answer_needed: filler, mic check, interviewer self-talk, ASR fragment with no coherent ask.
+
+Decide in order: is it filler/fragment → no_answer_needed; else must write code → coding; else must design an end-to-end system → system_design; else about past work → project_qa; else → chat.
+
+Output schema (no prose, no code fence):
+{"label": "<one of 5>", "confidence": 0.0-1.0, "reason": "one short sentence", "secondary_label": null | "<label>"}"""
 
 SYSTEM_PROMPT = """You are an expert at classifying interview conversation turns by intent.
 
@@ -35,8 +55,10 @@ LABEL DEFINITIONS
      ⚠️ A conceptual "what is X" or "explain X" question is ALWAYS chat, even if X is a systems/infra term.
      ⚠️ system_design requires the candidate to DESIGN something end-to-end, not define a term.
 
-3. **project_qa** — The turn drills into the candidate's past projects or work experience. Usually referencing their resume, a specific company, a specific project, or a past situation.
+3. **project_qa** — The turn drills into the candidate's past projects, work experience, or background/career. Usually referencing their resume, a specific company, a specific project, or a past situation.
    Positive examples:
+     • "Tell me about yourself." (open invitation to walk through career/background → project_qa)
+     • "Walk me through your background / experience."
      • "Tell me about a challenging project you worked on."
      • "Walk me through the architecture of the payment system you built at Uber."
      • "What was your role in the migration project you mentioned?"
@@ -53,12 +75,15 @@ LABEL DEFINITIONS
      • "What is React's virtual DOM?"
    Positive examples (small talk / logistics):
      • "How's your day going?"
-     • "Tell me about yourself."
      • "Can you share your screen?"
      • "Do you have any questions for me?"
    Key rule:
      If the question is asking the candidate to DEFINE, EXPLAIN, or COMPARE a concept/term — it's chat.
      Only promote to coding if they must WRITE code. Only promote to system_design if they must DESIGN an end-to-end multi-component system.
+   Library / tool usage Q&A also stays in chat:
+     • "In pandas, how do I drop a column?" → chat (usage question, not asked to write a full function)
+     • "What's the syntax for a list comprehension in Python?" → chat
+     Only promote to coding when the ask is clearly "write / implement / code" a function or algorithm end-to-end.
 
 5. **no_answer_needed** — The turn is not a real question to the candidate. Filler, instructions the interviewer gives themselves, mic checks, meta / administrative notes, or ASR noise.
    Positive examples:
@@ -67,6 +92,7 @@ LABEL DEFINITIONS
      • "Can you hear me? Sound check."
      • "Let me share my screen." (interviewer speaking to themselves, no expected candidate response)
      • (ASR noise captured from background audio, song lyrics, etc.)
+   ⚠️ ASR FRAGMENTS: Transcripts are noisy. If the turn is an incomplete sentence / trailing fragment with no coherent question or directive (e.g. "And standing up the new application towards 100%.", "So when you when you kind of know designing this type of microservices.", "Uh, which has details, uh, you can just write the array.") — classify as `no_answer_needed`, even if keywords like "design" or "write" appear. Do NOT force it into coding/system_design based on keyword match alone. A turn must contain a coherent, parseable ask (question mark, imperative, or clear request) to qualify for the other four labels.
 
 ═══════════════════════════════════════════════════════════════
 HOW TO DECIDE — DECISION ORDER
@@ -74,7 +100,7 @@ HOW TO DECIDE — DECISION ORDER
 
 Apply these checks IN ORDER. Stop at the first match:
 
-  Step 1. Is this not really a question to the candidate (filler / ASR noise / mic check / interviewer self-talk)?
+  Step 1. Is this not really a question to the candidate (filler / ASR noise / mic check / interviewer self-talk / incomplete sentence fragment with no coherent ask)?
           → no_answer_needed
 
   Step 2. Does the candidate need to WRITE CODE or describe an algorithm?

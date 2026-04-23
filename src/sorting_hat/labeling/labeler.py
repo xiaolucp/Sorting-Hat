@@ -162,9 +162,13 @@ class IntentLabeler:
             "max_tokens": self.max_tokens,
             "messages": messages,
             "response_format": {"type": "json_object"},
-            "temperature": 0.0,
             "stream": True,
         }
+        # gpt-5 and o-series only accept temperature=1 (their default); omit the knob entirely.
+        m = self.model.lower()
+        if not (m.startswith("azure/gpt-5") or m.startswith("gpt-5")
+                or "/o1" in m or "/o3" in m or "/o4" in m):
+            kwargs["temperature"] = 0.0
         if self.api_key:
             kwargs["api_key"] = self.api_key
         if self.api_base:
